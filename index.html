@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heat Kernel on the Sphere</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; color: #e6e8ee;
+    font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #panel { position: fixed; top: 12px; left: 12px; padding: 12px 14px; width: 250px;
+    background: rgba(20,24,34,.85); border: 1px solid #2a3142; border-radius: 10px; }
+  #panel h1 { font-size: 15px; margin: 0 0 6px; }
+  #panel p { margin: 0 0 10px; color: #aab; font-size: 12px; }
+  label { display: flex; justify-content: space-between; align-items: center; margin: 6px 0; }
+  input[type=range] { width: 130px; }
+  button { background: #2a3142; color: #e6e8ee; border: 0; border-radius: 6px;
+    padding: 6px 10px; cursor: pointer; margin-right: 6px; }
+  button:hover { background: #3a4460; }
+  #stats { margin-top: 8px; font-size: 12px; color: #aab; font-variant-numeric: tabular-nums; }
+  #bar { position: fixed; right: 16px; top: 50%; transform: translateY(-50%); width: 16px; height: 220px;
+    border: 1px solid #2a3142; border-radius: 4px; }
+  #barmax, #barmin { position: fixed; right: 40px; font-size: 12px; color: #aab; }
+  #barmax { top: calc(50% - 118px); } #barmin { top: calc(50% + 100px); }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>Heat equation on S²</h1>
+  <p>Click the sphere to drop a point of heat (a delta function). Click again to add more. Drag to rotate, scroll to zoom.</p>
+  <label>Speed <input id="speed" type="range" min="-3" max="1" step="0.05" value="-1.5"></label>
+  <label>Auto-scale colors <input id="auto" type="checkbox" checked></label>
+  <label>Max sources <input id="maxsrc" type="range" min="1" max="30" step="1" value="12"><span id="maxv">12</span></label>
+  <div>
+    <button id="pause">Pause</button><button id="reset">Reset</button>
+  </div>
+  <div id="stats"></div>
+</div>
+<canvas id="bar" width="16" height="220"></canvas>
+<div id="barmax">hot</div><div id="barmin">cold</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/*
+ * Heat equation on the unit sphere:  u_t = Δ_{S²} u.
+ * Heat kernel (solution for a delta at point p at time 0):
+ *   K(t, x, p) = Σ_{l≥0} (2l+1)/(4π) · e^{-l(l+1)t} · P_l(x·p)
+ * The equation is linear, so several clicks are summed (each shifted by its own start time).
+ * To keep the series finite, every source starts at a small age T0 (a very narrow bump
+ * instead of a true delta, which no finite mesh could resolve anyway).
+ */
+const T0 = 0.004;
+const LMAX = 110;
+
+// ---------- scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 0.6, 3.6);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enablePan = false; controls.minDistance = 1.8; controls.maxDistance = 8;
+
+const geo = new THREE.SphereGeometry(1, 160, 80);
+const N = geo.attributes.position.count;
+const pos = geo.attributes.position.array;
+// unit vertex vectors
+const vx = new Float32Array(N), vy = new Float32Array(N), vz = new Float32Array(N);
+for (let i = 0; i < N; i++) { vx[i] = pos[3*i]; vy[i] = pos[3*i+1]; vz[i] = pos[3*i+2]; }
+const colors = new Float32Array(N * 3);
+geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+const sphere = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true }));
+scene.add(sphere);
+
+// ---------- colormap (inferno-like) ----------
+const stops = [[0,0,0.02],[0.15,0.04,0.33],[0.45,0.1,0.43],[0.73,0.21,0.33],[0.93,0.41,0.15],[0.98,0.75,0.17],[0.99,1,0.65]];
+function cmap(v, out, o) {
+  v = v < 0 ? 0 : v > 1 ? 1 : v;
+  const s = v * (stops.length - 1), i = Math.min(Math.floor(s), stops.length - 2), f = s - i;
+  const a = stops[i], b = stops[i+1];
+  out[o] = a[0] + (b[0]-a[0])*f; out[o+1] = a[1] + (b[1]-a[1])*f; out[o+2] = a[2] + (b[2]-a[2])*f;
+}
+{ const c = document.getElementById('bar').getContext('2d'), tmp = [0,0,0];
+  for (let y = 0; y < 220; y++) { cmap(1 - y/219, tmp, 0);
+    c.fillStyle = `rgb(${tmp.map(x=>Math.round(x*255)).join(',')})`; c.fillRect(0, y, 16, 1); } }
+
+// ---------- state ----------
+let simTime = 0, paused = false;
+let sources = [];   // {x,y,z, t0}  t0 = simTime at click
+const field = new Float32Array(N);
+const $ = id => document.getElementById(id);
+
+// ---------- heat evaluation ----------
+function addSource(src, t) {
+  const age = t - src.t0 + T0;
+  const L = Math.min(LMAX, Math.ceil(Math.sqrt(16 / age)));
+  const c = new Float64Array(L + 1);
+  for (let l = 0; l <= L; l++) c[l] = (2*l + 1) / (4*Math.PI) * Math.exp(-l*(l+1)*age);
+  const { x: px, y: py, z: pz } = src;
+  for (let i = 0; i < N; i++) {
+    const x = vx[i]*px + vy[i]*py + vz[i]*pz;
+    let Pm = 1, P = x, sum = c[0] + (L >= 1 ? c[1]*x : 0);
+    for (let l = 1; l < L; l++) {
+      const Pn = ((2*l + 1) * x * P - l * Pm) / (l + 1);
+      Pm = P; P = Pn; sum += c[l+1] * P;
+    }
+    field[i] += sum;
+  }
+}
+
+function update() {
+  field.fill(0);
+  for (const s of sources) addSource(s, simTime);
+  let max = 1e-9, mean = 0;
+  for (let i = 0; i < N; i++) { if (field[i] > max) max = field[i]; mean += field[i]; }
+  mean /= N;
+  const scale = $('auto').checked ? max : 1 / (4*Math.PI) * 40; // fixed scale: 40x the uniform level
+  for (let i = 0; i < N; i++) cmap(Math.max(0, field[i]) / scale, colors, 3*i);
+  geo.attributes.color.needsUpdate = true;
+  $('stats').textContent =
+    `t = ${simTime.toFixed(3)}   sources: ${sources.length}\n` +
+    `peak = ${max.toFixed(3)}   mean = ${mean.toFixed(3)}`;
+  $('stats').style.whiteSpace = 'pre';
+  $('barmax').textContent = $('auto').checked ? `max ${max.toFixed(2)}` : `${scale.toFixed(2)}`;
+  $('barmin').textContent = '0';
+}
+
+// ---------- interaction ----------
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+let down = null;
+renderer.domElement.addEventListener('pointerdown', e => { down = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4) return; // it was a drag
+  ndc.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const hit = ray.intersectObject(sphere)[0];
+  if (!hit) return;
+  const p = hit.point.clone().normalize();
+  sources.push({ x: p.x, y: p.y, z: p.z, t0: simTime });
+  const max = +$('maxsrc').value;
+  if (sources.length > max) sources.splice(0, sources.length - max);
+  update();
+});
+$('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; };
+$('reset').onclick = () => { sources = []; simTime = 0; update(); };
+$('maxsrc').oninput = () => { $('maxv').textContent = $('maxsrc').value; };
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.1); last = now;
+  controls.update();
+  if (!paused && sources.length) {
+    // speed slider is log10 of "simulation time per real second"
+    simTime += dt * Math.pow(10, +$('speed').value);
+    update();
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+update();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
